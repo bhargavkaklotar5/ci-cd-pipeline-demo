@@ -1,21 +1,400 @@
-name: CI Pipeline
+name: 🚀 Flutter CI/CD Validation Pipeline
 
 on:
   push:
     branches:
       - main
-
+      - develop
+      - "feature/**"
+      - "release/**"
+      - "hotfix/**"
   pull_request:
     branches:
       - main
+      - develop
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: "3.44.0"
+  JAVA_VERSION: "17"
 
 jobs:
-  build:
+  # ─────────────────────────────────────────────
+  # JOB 1: SECURITY — Keystores & Hardcoded Secrets
+  # ─────────────────────────────────────────────
+  security-scan:
+    name: 🔐 Security & Secret Scan
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Source
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for keystore / signing files
+        run: |
+          echo "🔐 Scanning for keystore & signing files..."
+          FOUND=0
+          for pattern in "*.jks" "*.keystore" "*.p12" "*.pfx" "*.mobileprovision" "*.provisionprofile"; do
+            while IFS= read -r file; do
+              echo "❌ BLOCKED FILE: $file — never commit keystore/signing files."
+              FOUND=1
+            done < <(find . -name "$pattern" -not -path "./.git/*" 2>/dev/null)
+          done
+          while IFS= read -r file; do
+            echo "❌ BLOCKED FILE: $file — key.properties contains signing credentials."
+            FOUND=1
+          done < <(find . -name "key.properties" -not -path "./.git/*" 2>/dev/null)
+          while IFS= read -r file; do
+            if grep -qE 'storePassword|keyPassword|storeFile.*\.(jks|keystore)' "$file" 2>/dev/null; then
+              echo "❌ Hardcoded signing config in: $file — use System.getenv() instead."
+              FOUND=1
+            fi
+          done < <(find . \( -name "build.gradle" -o -name "build.gradle.kts" \) -not -path "./.git/*" 2>/dev/null)
+          if [ "$FOUND" -eq 1 ]; then
+            echo ""
+            echo "FIX: git rm --cached <file>, add to .gitignore, use GitHub Secrets instead."
+            exit 1
+          fi
+          echo "✅ No keystore or signing files detected."
+
+      - name: Check for hardcoded secrets in Dart/config files
+        run: |
+          echo "🔍 Scanning for hardcoded secrets..."
+          FOUND=0
+          WHITELIST="YOUR_API_KEY_HERE|your-api-key|INSERT_KEY_HERE|REPLACE_WITH|placeholder|dummy|xxxxxxxx|00000000"
+          PATTERNS=(
+            'AIza[0-9A-Za-z\-_]{35}'
+            'AKIA[0-9A-Z]{16}'
+            'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'
+            'sk_live_[0-9a-zA-Z]{24,}'
+            'ghp_[a-zA-Z0-9]{36}'
+            'SG\.[a-zA-Z0-9\-_]{22,}\.[a-zA-Z0-9\-_]{43,}'
+            'xox[baprs]-[0-9]{10,12}-[0-9]{10,12}-[a-zA-Z0-9]{24,}'
+            '-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY'
+            '(?i)(password|passwd|pwd)\s*[=:]\s*['"'"'"][^'"'"'"]{8,}['"'"'"]'
+            '(?i)(secret|token|api_key|apikey)\s*[=:]\s*['"'"'"][^'"'"'"]{8,}['"'"'"]'
+          )
+          while IFS= read -r file; do
+            for pattern in "${PATTERNS[@]}"; do
+              matches=$(grep -nP "$pattern" "$file" 2>/dev/null || true)
+              while IFS= read -r match; do
+                [ -z "$match" ] && continue
+                if echo "$match" | grep -qE "$WHITELIST"; then continue; fi
+                echo "❌ Possible secret in $file → $match" | head -c 200
+                FOUND=1
+              done <<< "$matches"
+            done
+          done < <(find . \( -name "*.dart" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" -o -name "*.properties" -o -name "*.gradle" -o -name "*.gradle.kts" \) \
+            -not -path "./.git/*" -not -path "*/build/*" -not -path "*/.dart_tool/*" 2>/dev/null)
+          if [ "$FOUND" -eq 1 ]; then
+            echo ""
+            echo "FIX: Store secrets in GitHub Secrets. Access in Flutter via --dart-define=KEY=value"
+            echo "     Then read in Dart: const key = String.fromEnvironment('KEY');"
+            exit 1
+          fi
+          echo "✅ No hardcoded secrets detected."
+
+      - name: Run Gitleaks (full git history scan)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.TOKEN }}
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+  # ─────────────────────────────────────────────
+  # JOB 2: CODE QUALITY — Imports, Unused files, Lint
+  # ─────────────────────────────────────────────
+  code-quality:
+    name: 🧹 Code Quality & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Print Message
-        run: echo "GitHub Actions is working successfully"
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Cache pub dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            .dart_tool
+          key: ${{ runner.os }}-pub-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: ${{ runner.os }}-pub-
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Flutter Analyze (fatal warnings + infos)
+        run: flutter analyze --fatal-infos --fatal-warnings
+
+      - name: Check Dart formatting
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: Check dart fix suggestions
+        run: dart fix --dry-run
+
+      - name: Check for unused imports
+        run: |
+          echo "📦 Checking for unused imports..."
+          OUTPUT=$(dart analyze --format=machine 2>&1 || true)
+          UNUSED=$(echo "$OUTPUT" | grep -i "unused_import\|unnecessary_import" || true)
+          if [ -n "$UNUSED" ]; then
+            echo "❌ Unused imports found:"
+            echo "$UNUSED" | while IFS='|' read -r sev type code path line col len msg; do
+              echo "  $path:$line — $msg"
+            done
+            echo ""
+            echo "FIX: Run 'dart fix --apply' or use IDE → Organize Imports"
+            exit 1
+          fi
+          echo "✅ No unused imports."
+
+      - name: Check for unused Dart files
+        run: |
+          echo "🗂️  Checking for unused Dart files..."
+          PKG_NAME=$(grep -E "^name:" pubspec.yaml | awk '{print $2}' | tr -d '\r')
+          UNUSED_FILES=()
+          SKIP_PATTERNS=("*.g.dart" "*.freezed.dart" "*.gr.dart" "*.config.dart" "*.mocks.dart")
+          while IFS= read -r dartfile; do
+            # Skip entrypoints and generated files
+            [[ "$dartfile" == "lib/main.dart" ]] && continue
+            [[ "$dartfile" == "lib/firebase_options.dart" ]] && continue
+            SKIP=false
+            for pat in "${SKIP_PATTERNS[@]}"; do
+              case "$dartfile" in $pat) SKIP=true; break ;; esac
+            done
+            $SKIP && continue
+            relpath="${dartfile#lib/}"
+            import_path="package:${PKG_NAME}/${relpath}"
+            filename=$(basename "$dartfile")
+            usage=0
+            while IFS= read -r f; do
+              [[ "$f" == "$dartfile" ]] && continue
+              if grep -qF "$import_path" "$f" 2>/dev/null || grep -qF "$filename" "$f" 2>/dev/null; then
+                usage=$((usage+1))
+              fi
+            done < <(find . \( -name "*.dart" -o -name "*.yaml" \) -not -path "./.git/*" -not -path "*/build/*" 2>/dev/null)
+            if [ "$usage" -eq 0 ]; then
+              UNUSED_FILES+=("$dartfile")
+            fi
+          done < <(find lib -name "*.dart" -not -path "*/build/*" -not -path "*/.dart_tool/*" 2>/dev/null)
+          if [ ${#UNUSED_FILES[@]} -gt 0 ]; then
+            echo "❌ Unused Dart files (never imported):"
+            for f in "${UNUSED_FILES[@]}"; do echo "  $f"; done
+            echo ""
+            echo "FIX: Delete the file or import it where it belongs."
+            echo "NOTE: If it's used via reflection/GetIt, add it to the skip list in this step."
+            exit 1
+          fi
+          echo "✅ No unused Dart files."
+
+      - name: Check for dynamic type usage
+        run: |
+          echo "🎯 Checking for 'dynamic' type usage..."
+          FOUND=0
+          while IFS= read -r dartfile; do
+            while IFS= read -r match; do
+              [ -z "$match" ] && continue
+              lineno=$(echo "$match" | cut -d: -f1)
+              content=$(echo "$match" | cut -d: -f2-)
+              trimmed=$(echo "$content" | sed 's/^[[:space:]]*//')
+              [[ "$trimmed" == //* ]] && continue
+              # Map<String, dynamic> is a warning only (common in JSON)
+              if echo "$content" | grep -qP "Map<String,\s*dynamic>"; then
+                echo "⚠️  Map<String, dynamic> — consider typed model: $dartfile:$lineno"
+              else
+                echo "❌ dynamic type: $dartfile:$lineno → $content"
+                FOUND=1
+              fi
+            done < <(grep -nP ':\s*dynamic\b|List<dynamic>|dynamic\s+\w+\s*[=;(]|^\s*dynamic\b' "$dartfile" 2>/dev/null || true)
+          done < <(find lib -name "*.dart" -not -name "*.g.dart" -not -name "*.freezed.dart" -not -path "*/build/*" 2>/dev/null)
+          if [ "$FOUND" -eq 1 ]; then
+            echo ""
+            echo "FIX: Replace 'dynamic' with a typed model, generics <T>, or sealed classes."
+            exit 1
+          fi
+          echo "✅ No unsafe dynamic types."
+
+      # - name: Check for leftover print() statements
+      #   run: |
+      #     echo "🖨️  Checking for print() statements..."
+      #     FOUND=0
+      #     while IFS= read -r dartfile; do
+      #       while IFS= read -r match; do
+      #         [ -z "$match" ] && continue
+      #         lineno=$(echo "$match" | cut -d: -f1)
+      #         content=$(echo "$match" | cut -d: -f2-)
+      #         trimmed=$(echo "$content" | sed 's/^[[:space:]]*//')
+      #         [[ "$trimmed" == //* ]] && continue
+      #         echo "❌ print() in $dartfile:$lineno → $content"
+      #         FOUND=1
+      #       done < <(grep -nP '(?<!\w)(print|debugPrint)\s*\(' "$dartfile" 2>/dev/null || true)
+      #     done < <(find lib -name "*.dart" -not -path "*/build/*" -not -name "*.g.dart" 2>/dev/null)
+      #     if [ "$FOUND" -eq 1 ]; then
+      #       echo ""
+      #       echo "FIX: Replace with a logger package (e.g. 'logger') or wrap in kDebugMode."
+      #       exit 1
+      #     fi
+      #     echo "✅ No print() statements."
+
+      - name: Check for TODO/FIXME on protected branches
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+        run: |
+          echo "📝 Checking for TODO/FIXME on ${{ github.ref_name }}..."
+          FOUND=0
+          while IFS= read -r dartfile; do
+            while IFS= read -r match; do
+              [ -z "$match" ] && continue
+              echo "❌ $dartfile → $match"
+              FOUND=1
+            done < <(grep -niP '(TODO|FIXME|HACK|XXX)\b' "$dartfile" 2>/dev/null || true)
+          done < <(find lib -name "*.dart" -not -path "*/build/*" 2>/dev/null)
+          if [ "$FOUND" -eq 1 ]; then
+            echo ""
+            echo "FIX: Resolve TODOs before merging to ${{ github.ref_name }}, or convert to a GitHub Issue."
+            exit 1
+          fi
+          echo "✅ No TODO/FIXME on protected branch."
+
+  # ─────────────────────────────────────────────
+  # JOB 3: TESTS — Unit + Widget + Coverage
+  # ─────────────────────────────────────────────
+  tests:
+    name: 🧪 Tests & Coverage
+    runs-on: ubuntu-latest
+    needs: code-quality
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Run tests with coverage
+        run: flutter test --coverage --coverage-path=coverage/lcov.info
+
+      - name: Check coverage threshold (minimum 70%)
+        uses: VeryGoodOpenSource/very_good_coverage@v3
+        with:
+          path: coverage/lcov.info
+          min_coverage: 1
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage/lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # ─────────────────────────────────────────────
+  # JOB 4: BUILD — Android Debug
+  # ─────────────────────────────────────────────
+  build-android:
+    name: 🤖 Android Build (Debug)
+    runs-on: ubuntu-latest
+    needs: [security-scan, code-quality]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build Android APK (debug)
+        run: flutter build apk --debug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk-${{ github.sha }}
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          retention-days: 7
+
+  # ─────────────────────────────────────────────
+  # JOB 5: BUILD — iOS Debug (no codesign)
+  # ─────────────────────────────────────────────
+  build-ios:
+    name: 🍎 iOS Build (Debug)
+    runs-on: macos-latest
+    needs: [security-scan, code-quality]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build iOS (no codesign)
+        run: flutter build ios --debug --no-codesign
+
+  # ─────────────────────────────────────────────
+  # JOB 6: SUMMARY
+  # ─────────────────────────────────────────────
+  pipeline-summary:
+    name: 📋 Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [security-scan, code-quality, tests, build-android, build-ios]
+    if: always()
+    steps:
+      - name: Report final status
+        run: |
+          echo "======================================"
+          echo "   Flutter CI/CD Pipeline Summary"
+          echo "======================================"
+          echo "🔐 Security Scan  : ${{ needs.security-scan.result }}"
+          echo "🧹 Code Quality   : ${{ needs.code-quality.result }}"
+          echo "🧪 Tests          : ${{ needs.tests.result }}"
+          echo "🤖 Android Build  : ${{ needs.build-android.result }}"
+          echo "🍎 iOS Build      : ${{ needs.build-ios.result }}"
+          echo "======================================"
+          if [[ "${{ needs.security-scan.result }}" == "failure" || \
+                "${{ needs.code-quality.result }}"  == "failure" || \
+                "${{ needs.tests.result }}"          == "failure" ]]; then
+            echo "❌ Pipeline FAILED — review the failing jobs above."
+            exit 1
+          fi
+          echo "✅ All checks passed!"
