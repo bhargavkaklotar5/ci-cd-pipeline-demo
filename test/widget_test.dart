@@ -8,7 +8,6 @@
 import 'package:cicd_pipline_demo/main.dart';
 import 'package:flutter_test/flutter_test.dart';
 
- 
 void main() {
   testWidgets('App renders title', (tester) async {
     // Build our app and trigger a frame.

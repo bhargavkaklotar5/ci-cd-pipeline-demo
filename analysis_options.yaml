@@ -216,7 +216,7 @@ linter:
     library_private_types_in_public_api: true
     # DISABLED: Conflicts with always_use_package_imports
     prefer_relative_imports: false
-    simple_directive_paths: true
+    # simple_directive_paths: true
     use_string_in_part_of_directives: true
 
     # ========================================================================
@@ -308,7 +308,7 @@ linter:
     remove_deprecations_in_breaking_versions: true
     require_trailing_commas: true
     secure_pubspec_urls: true
-    simplify_variable_pattern: true
+    # simplify_variable_pattern: true
     sort_pub_dependencies: true
     specify_nonobvious_local_variable_types: false
     specify_nonobvious_property_types: false
@@ -326,5 +326,5 @@ linter:
     use_test_throws_matchers: true
     use_truncating_division: true
     valid_regexps: true
-    var_with_no_type_annotation: true
+    # var_with_no_type_annotation: true
     void_checks: true
